@@ -1,11 +1,8 @@
 [phases.setup]
-nixPkgs = ["python311", "playwright"]
+aptPkgs = ["...", "libglib2.0-0"]
 
 [phases.install]
-cmds = [
-  "pip install -r requirements.txt",
-  "python -m playwright install chromium"
-]
+cmds = ["...", "python -m playwright install chromium"]
 
 [start]
 cmd = "python bot.py"
