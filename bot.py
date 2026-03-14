@@ -11,7 +11,7 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TB_SLUG = "28xgk8liiv8o"
-REPORT_CHANNEL_ID = 531653261728677921
+REPORT_CHANNEL_ID = 1482403704555573430
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -645,7 +645,7 @@ async def weeklybehind(interaction: discord.Interaction):
     except Exception as e:
         print(f"Error fetching points: {e}")
         await interaction.followup.send("Error fetching points. Check Railway logs.")
-        
+
 @tree.command(name="weeklyreport", description="Post the current automatic report")
 async def weeklyreport(interaction: discord.Interaction):
     await interaction.response.defer()
