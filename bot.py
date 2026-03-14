@@ -373,7 +373,8 @@ async def showpoints(interaction: discord.Interaction, user: str):
             f"{stats['url']}"
         )
     except Exception as e:
-        await interaction.followup.send(f"Error fetching points: `{e}`")
+    print(f"Error fetching points: {e}")
+    await interaction.followup.send("Error fetching points. Check Railway logs.")
 
 
 @tree.command(name="showchests", description="Show a player's chest count from TB Clan Tools")
@@ -396,7 +397,8 @@ async def showchests(interaction: discord.Interaction, user: str):
             f"{stats['url']}"
         )
     except Exception as e:
-        await interaction.followup.send(f"Error fetching chests: `{e}`")
+    print(f"Error fetching points: {e}")
+    await interaction.followup.send("Error fetching points. Check Railway logs.")
 
 
 @tree.command(name="showstats", description="Show a player's chest stats from TB Clan Tools")
@@ -425,7 +427,8 @@ async def showstats(interaction: discord.Interaction, user: str):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        await interaction.followup.send(f"Error fetching stats: `{e}`")
+    print(f"Error fetching points: {e}")
+    await interaction.followup.send("Error fetching points. Check Railway logs.")
 
 
 @tree.command(name="weeklytargets", description="Show current weekly clan target progress")
@@ -453,7 +456,8 @@ async def weeklytargets(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        await interaction.followup.send(f"Error fetching weekly targets: `{e}`")
+    print(f"Error fetching points: {e}")
+    await interaction.followup.send("Error fetching points. Check Railway logs.")
 
 @tree.command(name="weeklyplayer", description="Show weekly target stats for one player")
 @app_commands.describe(user="The player name as shown on the weekly targets dashboard")
@@ -480,7 +484,8 @@ async def weeklyplayer(interaction: discord.Interaction, user: str):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        await interaction.followup.send(f"Error fetching weekly player stats: `{e}`")
+    print(f"Error fetching points: {e}")
+    await interaction.followup.send("Error fetching points. Check Railway logs.")
 
 @tree.command(name="weeklytop", description="Show top weekly performers")
 async def weeklytop(interaction: discord.Interaction):
@@ -520,7 +525,8 @@ async def weeklytop(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        await interaction.followup.send(f"Error fetching weekly top players: `{e}`")
+    print(f"Error fetching points: {e}")
+    await interaction.followup.send("Error fetching points. Check Railway logs.")
 
 @tree.command(name="weeklyrisk", description="Show at-risk players from the weekly targets dashboard")
 async def weeklyrisk(interaction: discord.Interaction):
@@ -552,7 +558,8 @@ async def weeklyrisk(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        await interaction.followup.send(f"Error fetching at-risk players: `{e}`")
+    print(f"Error fetching points: {e}")
+    await interaction.followup.send("Error fetching points. Check Railway logs.")
         
 @tree.command(name="weeklybehind", description="Show players below 100% completion")
 async def weeklybehind(interaction: discord.Interaction):
@@ -596,6 +603,7 @@ async def weeklybehind(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        await interaction.followup.send(f"Error fetching players behind target: `{e}`")
+    print(f"Error fetching points: {e}")
+    await interaction.followup.send("Error fetching points. Check Railway logs.")
 
 bot.run(DISCORD_TOKEN)
