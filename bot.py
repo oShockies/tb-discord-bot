@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import asyncio
 import requests
 import discord
 from dotenv import load_dotenv
@@ -16,6 +18,30 @@ REPORT_CHANNEL_ID = 1482403704555573430
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
+playwright_instance = None
+browser_instance = None
+
+async def start_browser():
+    global playwright_instance, browser_instance
+
+    if browser_instance is None:
+        playwright_instance = await async_playwright().start()
+        browser_instance = await playwright_instance.chromium.launch(headless=True)
+        print("Shared Playwright browser started.")
+
+
+async def stop_browser():
+    global playwright_instance, browser_instance
+
+    if browser_instance is not None:
+        await browser_instance.close()
+        browser_instance = None
+
+    if playwright_instance is not None:
+        await playwright_instance.stop()
+        playwright_instance = None
+
+    print("Shared Playwright browser stopped.")
 
 
 def normalize_member_name(name: str) -> str:
@@ -45,13 +71,16 @@ def extract_stat_from_text(text: str, label: str) -> str | None:
 async def fetch_member_stats(member_name: str) -> dict:
     url = get_member_url(member_name)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=30000)
+    global browser_instance
 
+    page = await browser_instance.new_page()
+
+    try:
+        await page.goto(url, wait_until="networkidle", timeout=30000)
         text = await page.locator("body").inner_text()
-        await browser.close()
+
+    finally:
+        await page.close()
 
     print("\n===== PLAYER PAGE TEXT =====\n")
     print(text[:4000])
@@ -387,11 +416,191 @@ async def build_auto_report_embed():
     embed.add_field(name="Top 10 At-Risk Users", value=risk_text[:1024], inline=False)
 
     return embed
+def normalize_name(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+async def fetch_roster_names() -> list[str]:
+    players = await fetch_weekly_progress_players()
+
+    names: list[str] = []
+    seen = set()
+
+    for p in players:
+        name = p.get("name", "").strip()
+        if not name:
+            continue
+
+        key = normalize_name(name)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        names.append(name)
+
+    return names
+
+
+async def member_has_chest(member_name: str, chest_key: str) -> bool:
+    global browser_instance
+
+    url = get_member_url(member_name)
+    page = await browser_instance.new_page()
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        print(f"\n--- CHECKING {member_name} for {chest_key} ---")
+        await page.wait_for_timeout(1200)
+
+        # Try closing any popup/modal if present
+        close_button = page.locator("button").filter(has_text="Close")
+        if await close_button.count() > 0:
+            try:
+                await close_button.first.click(timeout=1000)
+                await page.wait_for_timeout(300)
+            except:
+                pass
+
+        # Fallback: press Escape in case a modal is open
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(200)
+        except:
+            pass
+
+        # Find the Chest History search box by scrolling until it appears
+        search_box = None
+
+        for _ in range(80):
+            exact_box = page.locator("input[placeholder='Search chests...']")
+            if await exact_box.count() > 0:
+                try:
+                    if await exact_box.first.is_visible():
+                        search_box = exact_box.first
+                        break
+                except:
+                    pass
+
+            fallback_box = page.locator("input[placeholder*='Search']")
+            if await fallback_box.count() > 0:
+                try:
+                    if await fallback_box.first.is_visible():
+                        search_box = fallback_box.first
+                        break
+                except:
+                    pass
+
+            await page.mouse.wheel(0, 2500)
+            await page.wait_for_timeout(700)
+
+        if search_box is None:
+            print(f"Search box not found for {member_name} - using fallback scan")
+
+            target_key = chest_key.strip().lower()
+            last_snapshot = ""
+            unchanged_rounds = 0
+
+            for _ in range(40):
+                body_text = await page.locator("body").inner_text()
+                lines = [line.strip().lower() for line in body_text.splitlines() if line.strip()]
+
+                if target_key in lines:
+                    print(f"Fallback found {target_key} for {member_name}")
+                    return True
+
+                snapshot = "\n".join(lines[-250:])
+                if snapshot == last_snapshot:
+                    unchanged_rounds += 1
+                else:
+                    unchanged_rounds = 0
+                    last_snapshot = snapshot
+
+                if unchanged_rounds >= 4:
+                    break
+
+                await page.mouse.wheel(0, 2500)
+                await page.wait_for_timeout(600)
+
+            return False
+
+        print(f"Search box FOUND for {member_name}")
+
+        # Type into the real search box so the site's filter actually runs
+        await search_box.focus()
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Backspace")
+        await search_box.type(chest_key, delay=40)
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(1200)
+
+        # Give filtered results time to load in
+        for _ in range(12):
+            body_text = await page.locator("body").inner_text()
+            body_lower = body_text.lower()
+
+            if chest_key.lower() in body_lower:
+                break
+
+            if "loading more chests" in body_lower:
+                await page.mouse.wheel(0, 1800)
+                await page.wait_for_timeout(700)
+            else:
+                await page.wait_for_timeout(500)
+
+        body_text = await page.locator("body").inner_text()
+        lines = [line.strip().lower() for line in body_text.splitlines() if line.strip()]
+
+        print(f"Found {len(lines)} visible lines for {member_name}")
+        for line in lines[-80:]:
+            print(repr(line))
+
+        target_key = chest_key.strip().lower()
+        print(f"Exact target key: {target_key}")
+        print(f"Exact match result: {target_key in lines}")
+
+        return target_key in lines
+
+    except Exception as e:
+        print(f"member_has_chest error for {member_name}: {e}")
+        return False
+
+    finally:
+        await page.close()
+
+
+async def find_members_missing_chest(chest_key: str) -> tuple[list[str], list[str]]:
+    roster = await fetch_roster_names()
+
+    has_chest: list[str] = []
+    missing: list[str] = []
+
+    for name in roster:
+        try:
+            found = await member_has_chest(name, chest_key)
+            if found:
+                has_chest.append(name)
+            else:
+                missing.append(name)
+        except Exception as e:
+            print(f"Error checking {name} for {chest_key}: {e}")
+            missing.append(name)
+
+    return has_chest, missing
+
+async def check_member_for_chest(name: str, chest: str, semaphore: asyncio.Semaphore):
+    async with semaphore:
+        found = await member_has_chest(name, chest)
+        return name, found
+    
+async def recheck_member_for_chest(name: str, chest: str):
+    found = await member_has_chest(name, chest)
+    return name, found
+
 @bot.event
 async def on_ready():
+    await start_browser()
     await tree.sync()
     print(f"Logged in as {bot.user}")
-
 
 @tree.command(name="showpoints", description="Show a player's points from TB Clan Tools")
 @app_commands.describe(user="The player name as shown in TB Clan Tools")
@@ -657,5 +866,101 @@ async def weeklyreport(interaction: discord.Interaction):
     except Exception as e:
         print(f"weeklyreport error: {e}")
         await interaction.followup.send("Error generating report. Check Railway logs.")
+
+@tree.command(name="missingchest", description="Show members missing a specific chest")
+@app_commands.describe(chest="Chest source key, for example jormungandr_shop")
+async def missingchest(interaction: discord.Interaction, chest: str):
+    await interaction.response.defer()
+
+    try:
+        roster = await fetch_roster_names()
+        total_members = len(roster)
+
+        has_chest: list[str] = []
+        missing: list[str] = []
+
+        semaphore = asyncio.Semaphore(2)
+
+        tasks_list = [
+            check_member_for_chest(name, chest, semaphore)
+            for name in roster
+        ]
+
+        completed = 0
+
+        for coro in asyncio.as_completed(tasks_list):
+            name, found = await coro
+            completed += 1
+
+            if found:
+                has_chest.append(name)
+            else:
+                missing.append(name)
+
+        # Recheck only the initially-missing players to reduce false negatives
+        if missing:
+            print(f"Rechecking {len(missing)} initially-missing players...")
+
+            retry_missing = []
+            retry_has_chest = []
+
+            for name in missing:
+                try:
+                    result_name, found = await recheck_member_for_chest(name, chest)
+                    if found:
+                        retry_has_chest.append(result_name)
+                    else:
+                        retry_missing.append(result_name)
+                except Exception as e:
+                    print(f"Recheck failed for {name}: {e}")
+                    retry_missing.append(name)
+
+            # Move re-found players out of missing list
+            has_chest.extend(retry_has_chest)
+            missing = retry_missing
+
+        has_chest = sorted(set(has_chest), key=str.lower)
+        missing = sorted(set(missing), key=str.lower)
+        embed = discord.Embed(
+            title=f"Missing Chest Report: {chest}",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Total Members", value=str(total_members), inline=True)
+        embed.add_field(name="Have Chest", value=str(len(has_chest)), inline=True)
+        embed.add_field(name="Missing Chest", value=str(len(missing)), inline=True)
+
+        preview = "\n".join(f"- {name}" for name in missing[:20]) or "Nobody missing this chest."
+        embed.add_field(
+            name="Missing Members (first 20)",
+            value=preview[:1024],
+            inline=False
+        )
+
+        await interaction.followup.send(embed=embed)
+
+        if missing:
+            txt = "Members missing chest: " + chest + "\n\n" + "\n".join(missing)
+            file_obj = io.BytesIO(txt.encode("utf-8"))
+            await interaction.followup.send(
+                file=discord.File(file_obj, filename=f"missing_{chest}.txt")
+            )
+
+    except Exception as e:
+        print(f"missingchest error: {e}")
+        await interaction.followup.send("Error running missingchest. Check Railway logs.")
+
+@tree.command(name="testmemberchest", description="Test whether one member has a specific chest")
+@app_commands.describe(user="Member name", chest="Chest source key")
+async def testmemberchest(interaction: discord.Interaction, user: str, chest: str):
+    await interaction.response.defer()
+
+    try:
+        found = await member_has_chest(user, chest)
+        await interaction.followup.send(
+            f"**{user}** -> {'FOUND' if found else 'NOT FOUND'} for **{chest}**"
+        )
+    except Exception as e:
+        print(f"testmemberchest error: {e}")
+        await interaction.followup.send("Error testing member chest. Check Railway logs.")        
 
 bot.run(DISCORD_TOKEN)
