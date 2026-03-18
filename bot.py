@@ -72,57 +72,103 @@ async def fetch_member_stats(member_name: str) -> dict:
     url = get_member_url(member_name)
 
     global browser_instance
-
     page = await browser_instance.new_page()
 
     try:
-        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(1500)
         text = await page.locator("body").inner_text()
 
     finally:
         await page.close()
 
-    print("\n===== PLAYER PAGE TEXT =====\n")
-    print(text[:4000])
-    print("\n============================\n")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lower_lines = [line.lower() for line in lines]
 
-    points = None
-    chests = None
-    lines = text.splitlines()
+    def value_before(label: str, max_lookback: int = 2):
+        label = label.lower()
+        for i, line in enumerate(lower_lines):
+            if line == label:
+                for j in range(1, max_lookback + 1):
+                    if i - j >= 0:
+                        candidate = lines[i - j].strip()
+                        if candidate and candidate.lower() != label:
+                            return candidate
+        return None
 
-    print("\n===== MATCH LINES =====")
-    for line in lines:
-        low = line.lower().strip()
+    def pair_after(label: str, max_lookahead: int = 3):
+        label = label.lower()
+        for i, line in enumerate(lower_lines):
+            if line == label:
+                first = None
+                second = None
+                k = 1
+                while i + k < len(lines) and k <= max_lookahead + 2:
+                    candidate = lines[i + k].strip()
+                    if candidate:
+                        if first is None:
+                            first = candidate
+                        elif second is None:
+                            second = candidate
+                            break
+                    k += 1
+                return first, second
+        return None, None
 
-        if "point" in low or "chest" in low:
-            print(line)
+    total_chests = value_before("Total Chests")
+    total_score = value_before("Total Score")
+    active_days = value_before("Active Days")
+    daily_average = value_before("Daily Average")
 
-        if "chest" in low and not chests:
-            match = re.search(r'([\d,]+)\s*/\s*([\d,]+)\s*chests?', line, re.IGNORECASE)
-            if match:
-                chests = match.group(1)
-            else:
-                match = re.search(r'([\d,]+)\s*chests?', line, re.IGNORECASE)
-                if match:
-                    chests = match.group(1)
+    weekly_change_value, weekly_change_sub = pair_after("Weekly Change")
+    thirty_day_chests_value, thirty_day_chests_sub = pair_after("30-Day Chests")
+    current_streak_value, current_streak_sub = pair_after("Current Streak")
+    best_streak_value, best_streak_sub = pair_after("Best Streak")
+    rank_value, rank_sub = pair_after("Rank (Chests)")
+    vs_clan_avg_value, vs_clan_avg_sub = pair_after("vs Clan Avg")
+    best_day_value, best_day_sub = pair_after("Best Day")
+    consistency_value, consistency_sub = pair_after("Consistency")
 
-        if "point" in low and not points:
-            match = re.search(
-                r'([\d,.]+(?:[kKmM])?)\s*(?:/\s*[\d,.]+(?:[kKmM])?)?\s*points?',
-                line,
-                re.IGNORECASE
-            )
-            if match:
-                points = match.group(1)
-
-    print("=======================\n")
+    found_anything = any([
+        total_chests, total_score, active_days, daily_average,
+        weekly_change_value, thirty_day_chests_value, current_streak_value,
+        best_streak_value, rank_value, vs_clan_avg_value, best_day_value,
+        consistency_value
+    ])
 
     return {
         "member": member_name,
         "url": url,
-        "points": points,
-        "chests": chests,
-        "found_anything": bool(points or chests),
+        "found_anything": found_anything,
+
+        "total_chests": total_chests,
+        "total_score": total_score,
+        "active_days": active_days,
+        "daily_average": daily_average,
+
+        "weekly_change_value": weekly_change_value,
+        "weekly_change_sub": weekly_change_sub,
+
+        "thirty_day_chests_value": thirty_day_chests_value,
+        "thirty_day_chests_sub": thirty_day_chests_sub,
+
+        "current_streak_value": current_streak_value,
+        "current_streak_sub": current_streak_sub,
+
+        "best_streak_value": best_streak_value,
+        "best_streak_sub": best_streak_sub,
+
+        "rank_value": rank_value,
+        "rank_sub": rank_sub,
+
+        "vs_clan_avg_value": vs_clan_avg_value,
+        "vs_clan_avg_sub": vs_clan_avg_sub,
+
+        "best_day_value": best_day_value,
+        "best_day_sub": best_day_sub,
+
+        "consistency_value": consistency_value,
+        "consistency_sub": consistency_sub,
     }
 async def fetch_dashboard_targets() -> dict:
     url = f"https://tbclantools.com/p/{TB_SLUG}"
@@ -650,7 +696,7 @@ async def showchests(interaction: discord.Interaction, user: str):
         await interaction.followup.send("Error fetching points. Check Railway logs.")
 
 
-@tree.command(name="showstats", description="Show a player's chest stats from TB Clan Tools")
+@tree.command(name="showstats", description="Show a player's full stats from TB Clan Tools")
 @app_commands.describe(user="The player name as shown in TB Clan Tools")
 async def showstats(interaction: discord.Interaction, user: str):
     await interaction.response.defer()
@@ -662,22 +708,100 @@ async def showstats(interaction: discord.Interaction, user: str):
             await interaction.followup.send(f"I couldn't find stats for **{user}**.")
             return
 
-        points = stats["points"] or "Not found on player page"
-        chests = stats["chests"] or "Not found"
-
         embed = discord.Embed(
             title=f"Stats for {user}",
-            color=discord.Color.green()
+            color=discord.Color.green(),
+            url=stats["url"]
         )
 
-        embed.add_field(name="Points", value=points, inline=True)
-        embed.add_field(name="Chests", value=chests, inline=True)
+        embed.add_field(
+            name="Overview",
+            value=(
+                f"**Total Chests:** {stats['total_chests'] or 'Not found'}\n"
+                f"**Total Score:** {stats['total_score'] or 'Not found'}\n"
+                f"**Active Days:** {stats['active_days'] or 'Not found'}\n"
+                f"**Daily Average:** {stats['daily_average'] or 'Not found'}"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="Weekly Change",
+            value=(
+                f"**Value:** {stats['weekly_change_value'] or 'Not found'}\n"
+                f"**Detail:** {stats['weekly_change_sub'] or 'Not found'}"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="30-Day Chests",
+            value=(
+                f"**Value:** {stats['thirty_day_chests_value'] or 'Not found'}\n"
+                f"**Detail:** {stats['thirty_day_chests_sub'] or 'Not found'}"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Current Streak",
+            value=(
+                f"**Value:** {stats['current_streak_value'] or 'Not found'}\n"
+                f"**Detail:** {stats['current_streak_sub'] or 'Not found'}"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Best Streak",
+            value=(
+                f"**Value:** {stats['best_streak_value'] or 'Not found'}\n"
+                f"**Detail:** {stats['best_streak_sub'] or 'Not found'}"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Rank",
+            value=(
+                f"**Value:** {stats['rank_value'] or 'Not found'}\n"
+                f"**Detail:** {stats['rank_sub'] or 'Not found'}"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="vs Clan Average",
+            value=(
+                f"**Value:** {stats['vs_clan_avg_value'] or 'Not found'}\n"
+                f"**Detail:** {stats['vs_clan_avg_sub'] or 'Not found'}"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Best Day",
+            value=(
+                f"**Value:** {stats['best_day_value'] or 'Not found'}\n"
+                f"**Detail:** {stats['best_day_sub'] or 'Not found'}"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Consistency",
+            value=(
+                f"**Value:** {stats['consistency_value'] or 'Not found'}\n"
+                f"**Detail:** {stats['consistency_sub'] or 'Not found'}"
+            ),
+            inline=True
+        )
 
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        print(f"Error fetching points: {e}")
-        await interaction.followup.send("Error fetching points. Check Railway logs.")
+        print(f"Error fetching full stats: {e}")
+        await interaction.followup.send("Error fetching stats. Check Railway logs.")
 
 
 @tree.command(name="weeklytargets", description="Show current weekly clan target progress")
