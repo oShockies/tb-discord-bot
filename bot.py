@@ -648,7 +648,7 @@ async def on_ready():
     await tree.sync()
     print(f"Logged in as {bot.user}")
 
-@tree.command(name="showpoints", description="Show a player's points from TB Clan Tools")
+@tree.command(name="showtotalpoints", description="Show a player's points from TB Clan Tools")
 @app_commands.describe(user="The player name as shown in TB Clan Tools")
 async def showpoints(interaction: discord.Interaction, user: str):
     await interaction.response.defer()
@@ -656,7 +656,7 @@ async def showpoints(interaction: discord.Interaction, user: str):
     try:
         stats = await fetch_member_stats(user)
 
-        if not stats["points"]:
+        if not stats["found_anything"] or not stats["total_score"]:
             await interaction.followup.send(
                 f"I couldn't find points for **{user}**.\n"
                 f"Page checked: {stats['url']}"
@@ -664,15 +664,16 @@ async def showpoints(interaction: discord.Interaction, user: str):
             return
 
         await interaction.followup.send(
-            f"**{user}** has **{stats['points']} points**.\n"
+            f"**{user}** has **{stats['total_score']} total score**.\n"
             f"{stats['url']}"
         )
+
     except Exception as e:
         print(f"Error fetching points: {e}")
         await interaction.followup.send("Error fetching points. Check Railway logs.")
 
 
-@tree.command(name="showchests", description="Show a player's chest count from TB Clan Tools")
+@tree.command(name="showtotalchests", description="Show a player's total chest count from TB Clan Tools")
 @app_commands.describe(user="The player name as shown in TB Clan Tools")
 async def showchests(interaction: discord.Interaction, user: str):
     await interaction.response.defer()
@@ -680,7 +681,7 @@ async def showchests(interaction: discord.Interaction, user: str):
     try:
         stats = await fetch_member_stats(user)
 
-        if not stats["chests"]:
+        if not stats["found_anything"] or not stats["total_chests"]:
             await interaction.followup.send(
                 f"I couldn't find chests for **{user}**.\n"
                 f"Page checked: {stats['url']}"
@@ -688,12 +689,13 @@ async def showchests(interaction: discord.Interaction, user: str):
             return
 
         await interaction.followup.send(
-            f"**{user}** has **{stats['chests']} chests**.\n"
+            f"**{user}** has **{stats['total_chests']} total chests**.\n"
             f"{stats['url']}"
         )
+
     except Exception as e:
-        print(f"Error fetching points: {e}")
-        await interaction.followup.send("Error fetching points. Check Railway logs.")
+        print(f"Error fetching chests: {e}")
+        await interaction.followup.send("Error fetching chests. Check Railway logs.")
 
 
 @tree.command(name="showstats", description="Show a player's full stats from TB Clan Tools")
@@ -1072,19 +1074,6 @@ async def missingchest(interaction: discord.Interaction, chest: str):
     except Exception as e:
         print(f"missingchest error: {e}")
         await interaction.followup.send("Error running missingchest. Check Railway logs.")
-
-@tree.command(name="testmemberchest", description="Test whether one member has a specific chest")
-@app_commands.describe(user="Member name", chest="Chest source key")
-async def testmemberchest(interaction: discord.Interaction, user: str, chest: str):
-    await interaction.response.defer()
-
-    try:
-        found = await member_has_chest(user, chest)
-        await interaction.followup.send(
-            f"**{user}** -> {'FOUND' if found else 'NOT FOUND'} for **{chest}**"
-        )
-    except Exception as e:
-        print(f"testmemberchest error: {e}")
-        await interaction.followup.send("Error testing member chest. Check Railway logs.")        
+    
 
 bot.run(DISCORD_TOKEN)
