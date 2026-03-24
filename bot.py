@@ -21,13 +21,72 @@ tree = bot.tree
 playwright_instance = None
 browser_instance = None
 
+
 async def start_browser():
     global playwright_instance, browser_instance
 
-    if browser_instance is None:
+    if playwright_instance is None:
         playwright_instance = await async_playwright().start()
+
+    if browser_instance is None or not browser_instance.is_connected():
         browser_instance = await playwright_instance.chromium.launch(headless=True)
         print("Shared Playwright browser started.")
+
+
+async def ensure_browser():
+    global playwright_instance, browser_instance
+
+    if playwright_instance is None:
+        playwright_instance = await async_playwright().start()
+
+    if browser_instance is None or not browser_instance.is_connected():
+        browser_instance = await playwright_instance.chromium.launch(headless=True)
+        print("Shared Playwright browser restarted.")
+
+
+async def get_page_text(url: str, *, wait_until: str = "domcontentloaded", timeout: int = 30000, extra_wait_ms: int = 1200) -> str:
+    await ensure_browser()
+
+    global browser_instance
+    last_error = None
+
+    for attempt in range(2):
+        page = None
+        try:
+            page = await browser_instance.new_page()
+            await page.goto(url, wait_until=wait_until, timeout=timeout)
+            if extra_wait_ms:
+                await page.wait_for_timeout(extra_wait_ms)
+            return await page.locator("body").inner_text()
+        except Exception as e:
+            last_error = e
+            print(f"get_page_text attempt {attempt + 1} failed for {url}: {e}")
+
+            try:
+                if page is not None:
+                    await page.close()
+            except:
+                pass
+
+            if attempt == 0:
+                try:
+                    if browser_instance is not None:
+                        await browser_instance.close()
+                except:
+                    pass
+                browser_instance = None
+                await ensure_browser()
+                continue
+
+            raise
+        finally:
+            try:
+                if page is not None:
+                    await page.close()
+            except:
+                pass
+
+    raise last_error
 
 
 async def stop_browser():
@@ -70,17 +129,7 @@ def extract_stat_from_text(text: str, label: str) -> str | None:
 
 async def fetch_member_stats(member_name: str) -> dict:
     url = get_member_url(member_name)
-
-    global browser_instance
-    page = await browser_instance.new_page()
-
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(1500)
-        text = await page.locator("body").inner_text()
-
-    finally:
-        await page.close()
+    text = await get_page_text(url, wait_until="domcontentloaded", timeout=30000, extra_wait_ms=1500)
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     lower_lines = [line.lower() for line in lines]
@@ -172,14 +221,7 @@ async def fetch_member_stats(member_name: str) -> dict:
     }
 async def fetch_dashboard_targets() -> dict:
     url = f"https://tbclantools.com/p/{TB_SLUG}"
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-
-        text = await page.locator("body").inner_text()
-        await browser.close()
+    text = await get_page_text(url, wait_until="networkidle", timeout=30000, extra_wait_ms=1200)
 
     print("\n===== DASHBOARD TEXT =====\n")
     print(text[:6000])
@@ -294,14 +336,7 @@ async def fetch_weekly_player_stats(member_name: str) -> dict:
     }
 async def fetch_weekly_progress_players() -> list[dict]:
     url = f"https://tbclantools.com/p/{TB_SLUG}"
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-
-        text = await page.locator("body").inner_text()
-        await browser.close()
+    text = await get_page_text(url, wait_until="networkidle", timeout=30000, extra_wait_ms=1200)
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -362,14 +397,7 @@ async def fetch_weekly_progress_players() -> list[dict]:
 
 async def fetch_at_risk_players() -> list[dict]:
     url = f"https://tbclantools.com/p/{TB_SLUG}"
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-
-        text = await page.locator("body").inner_text()
-        await browser.close()
+    text = await get_page_text(url, wait_until="networkidle", timeout=30000, extra_wait_ms=1200)
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -488,8 +516,9 @@ async def fetch_roster_names() -> list[str]:
 
 
 async def member_has_chest(member_name: str, chest_key: str) -> bool:
-    global browser_instance
+    await ensure_browser()
 
+    global browser_instance
     url = get_member_url(member_name)
     page = await browser_instance.new_page()
 
@@ -847,7 +876,7 @@ async def weeklyplayer(interaction: discord.Interaction, user: str):
             return
 
         embed = discord.Embed(
-            title=f"Weekly Target Stats for {user}",
+            title=f"Weekly Target Stats for {stats['member']}",
             color=discord.Color.orange()
         )
 
@@ -855,6 +884,9 @@ async def weeklyplayer(interaction: discord.Interaction, user: str):
         embed.add_field(name="Chests", value=stats["chests"] or "Not found", inline=False)
         embed.add_field(name="Status", value=stats["status"] or "Not found", inline=False)
         embed.add_field(name="Completion", value=stats["percent"] or "Not found", inline=False)
+
+        if stats.get("duplicate"):
+            embed.set_footer(text="Duplicate player names detected on the website. Showing the first exact match found.")
 
         await interaction.followup.send(embed=embed)
 
