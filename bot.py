@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-TB_SLUG = "28xgk8liiv8o"
+TB_SLUG = "i9avgsds5qc2"
 REPORT_CHANNEL_ID = 1482403704555573430
 
 intents = discord.Intents.default()
