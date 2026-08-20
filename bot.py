@@ -4,7 +4,7 @@ import io
 import asyncio
 import hashlib
 import xml.etree.ElementTree as ET
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 import discord
@@ -33,6 +33,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 playwright_instance = None
 browser_instance = None
+news_check_lock = asyncio.Lock()
 
 
 async def start_browser():
@@ -834,6 +835,75 @@ async def _recent_embed_urls(channel, limit: int = 200) -> set[str]:
     return urls
 
 
+def _youtube_video_id_from_url(url: str | None) -> str | None:
+    """Extract a stable YouTube video ID from common YouTube/thumbnail URLs."""
+    if not url:
+        return None
+
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        path = parsed.path.strip('/')
+
+        if 'youtube.com' in host:
+            if path == 'watch':
+                value = parse_qs(parsed.query).get('v', [None])[0]
+                return value or None
+            if path.startswith(('shorts/', 'embed/', 'live/')):
+                parts = path.split('/')
+                if len(parts) >= 2:
+                    return parts[1]
+
+        if host.endswith('youtu.be') and path:
+            return path.split('/')[0]
+
+        # YouTube thumbnail URLs look like /vi/VIDEO_ID/hqdefault.jpg
+        if 'ytimg.com' in host:
+            parts = path.split('/')
+            if len(parts) >= 2 and parts[0] == 'vi':
+                return parts[1]
+    except Exception:
+        return None
+
+    return None
+
+
+async def _recent_youtube_video_ids(channel, limit: int = 300) -> set[str]:
+    """Read bot-authored messages and recover YouTube IDs from embed URLs/images."""
+    video_ids: set[str] = set()
+
+    try:
+        async for message in channel.history(limit=limit):
+            if bot.user is not None and message.author.id != bot.user.id:
+                continue
+
+            for embed in message.embeds:
+                candidates = [embed.url]
+
+                if embed.image and embed.image.url:
+                    candidates.append(embed.image.url)
+                if embed.thumbnail and embed.thumbnail.url:
+                    candidates.append(embed.thumbnail.url)
+
+                for candidate in candidates:
+                    video_id = _youtube_video_id_from_url(candidate)
+                    if video_id:
+                        video_ids.add(video_id)
+
+            # Fallback in case an older version ever posted a plain YouTube URL.
+            for match in re.findall(r'https?://\S+', message.content or ''):
+                video_id = _youtube_video_id_from_url(match.rstrip('>),.'))
+                if video_id:
+                    video_ids.add(video_id)
+
+    except Exception as e:
+        print(f"Could not read YouTube history in {getattr(channel, 'id', '?')}: {e}")
+        raise
+
+    print(f"YouTube duplicate check found {len(video_ids)} previously-posted video ID(s).")
+    return video_ids
+
+
 def _new_items_since_last_seen(items: list[dict], posted_urls: set[str], max_items: int = 5) -> list[dict]:
     if not items:
         return []
@@ -856,9 +926,26 @@ def _new_items_since_last_seen(items: list[dict], posted_urls: set[str], max_ite
 
 
 async def _post_youtube_updates(channel, entries: list[dict]) -> int:
-    posted_urls = await _recent_embed_urls(channel)
-    youtube_posts = {u for u in posted_urls if "youtube.com/watch" in u}
-    unseen = _new_items_since_last_seen(entries, youtube_posts)
+    posted_video_ids = await _recent_youtube_video_ids(channel)
+
+    if not entries:
+        return 0
+
+    first_known_index = next(
+        (i for i, entry in enumerate(entries) if entry["video_id"] in posted_video_ids),
+        None,
+    )
+
+    # Brand-new feed: post only the newest current video as the baseline.
+    if first_known_index is None:
+        unseen = entries[:1]
+    else:
+        # The YouTube feed is newest -> oldest. Only entries before the newest
+        # video we have already posted can actually be new.
+        unseen = [
+            entry for entry in entries[:first_known_index]
+            if entry["video_id"] not in posted_video_ids
+        ][:5]
 
     count = 0
     for entry in reversed(unseen):
@@ -873,7 +960,7 @@ async def _post_youtube_updates(channel, entries: list[dict]) -> int:
         embed.set_footer(text="Automatic TB News Feed")
 
         await channel.send(embed=embed)
-        posted_urls.add(entry["url"])
+        posted_video_ids.add(entry["video_id"])
         count += 1
 
     return count
@@ -945,6 +1032,12 @@ async def _post_patch_update(channel, patch: dict) -> int:
 
 
 async def run_news_feed_check() -> dict:
+    # Prevent the scheduled loop and /newscheck from running at the same time.
+    async with news_check_lock:
+        return await _run_news_feed_check_locked()
+
+
+async def _run_news_feed_check_locked() -> dict:
     results = {"youtube": 0, "official_news": 0, "patch": 0, "errors": []}
 
     fetch_results = await asyncio.gather(
