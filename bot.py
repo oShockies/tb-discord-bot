@@ -2,6 +2,10 @@ import os
 import re
 import io
 import asyncio
+import hashlib
+import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
+
 import requests
 import discord
 from dotenv import load_dotenv
@@ -14,6 +18,15 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TB_SLUG = "i9avgsds5qc2"
 REPORT_CHANNEL_ID = 1482403704555573430
+
+# Automatic Total Battle news feed
+TB_NEWS_CHANNEL_ID = int(os.getenv("TB_NEWS_CHANNEL_ID", "1540130173339304070"))
+TB_GAME_UPDATES_CHANNEL_ID = int(os.getenv("TB_GAME_UPDATES_CHANNEL_ID", "1540133351778816040"))
+TB_YOUTUBE_CHANNEL_ID = "UCinLkVkZEiHIaMxlk1AMqmQ"
+TB_YOUTUBE_FEED_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={TB_YOUTUBE_CHANNEL_ID}"
+TB_WHATS_NEW_URL = "https://scorewarrior.theymes.com/hc/en/total-battle/categories/whats-new-30"
+TB_PATCH_NOTES_URL = "https://scorewarrior.theymes.com/hc/en/total-battle/articles/patch-notes-464"
+NEWS_CHECK_MINUTES = 15
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -671,11 +684,384 @@ async def recheck_member_for_chest(name: str, chest: str):
     found = await member_has_chest(name, chest)
     return name, found
 
+
+# =========================
+# TOTAL BATTLE NEWS FEED
+# =========================
+
+def _clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _http_get(url: str) -> requests.Response:
+    response = requests.get(
+        url,
+        timeout=25,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/151 Safari/537.36"
+            )
+        },
+    )
+    response.raise_for_status()
+    return response
+
+
+def _fetch_youtube_entries_sync(limit: int = 8) -> list[dict]:
+    response = _http_get(TB_YOUTUBE_FEED_URL)
+    root = ET.fromstring(response.content)
+
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "yt": "http://www.youtube.com/xml/schemas/2015",
+        "media": "http://search.yahoo.com/mrss/",
+    }
+
+    entries = []
+    for entry in root.findall("atom:entry", ns)[:limit]:
+        video_id = entry.findtext("yt:videoId", default="", namespaces=ns).strip()
+        title = entry.findtext("atom:title", default="New Total Battle video", namespaces=ns).strip()
+        published = entry.findtext("atom:published", default="", namespaces=ns).strip()
+
+        link_el = entry.find("atom:link", ns)
+        url = link_el.get("href", "") if link_el is not None else ""
+        if not url and video_id:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+
+        if not video_id or not url:
+            continue
+
+        entries.append(
+            {
+                "video_id": video_id,
+                "title": title,
+                "url": url,
+                "published": published,
+                "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            }
+        )
+
+    return entries
+
+
+def _fetch_help_center_articles_sync(limit: int = 20) -> list[dict]:
+    response = _http_get(TB_WHATS_NEW_URL)
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    articles = []
+    seen_urls = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = anchor.get("href", "")
+        url = urljoin(TB_WHATS_NEW_URL, href)
+
+        if "/hc/en/total-battle/articles/" not in url:
+            continue
+
+        url = url.split("#", 1)[0].split("?", 1)[0]
+        if url in seen_urls:
+            continue
+
+        title = _clean_text(anchor.get_text(" ", strip=True))
+        if not title:
+            continue
+
+        seen_urls.add(url)
+        articles.append({"title": title, "url": url})
+
+        if len(articles) >= limit:
+            break
+
+    return articles
+
+
+def _fetch_patch_snapshot_sync() -> dict:
+    response = _http_get(TB_PATCH_NOTES_URL)
+    soup = BeautifulSoup(response.text, "html.parser")
+    container = soup.find("article") or soup.find("main") or soup.body or soup
+    text = _clean_text(container.get_text(" ", strip=True))
+
+    version_match = re.search(r"\bV(\d{3,})\b", text, re.IGNORECASE)
+    if version_match:
+        version = f"v{version_match.group(1)}"
+        start = max(0, version_match.start() - 180)
+        summary = text[start:start + 900]
+    else:
+        digest = hashlib.sha1(text[:6000].encode("utf-8")).hexdigest()[:12]
+        version = f"snapshot-{digest}"
+        summary = text[:900]
+
+    summary = _clean_text(summary)
+    if len(summary) > 650:
+        summary = summary[:647].rstrip() + "..."
+
+    # The query parameter makes each patch version's embed URL unique while
+    # still opening the same official Patch Notes page when clicked.
+    unique_url = f"{TB_PATCH_NOTES_URL}?version={version}"
+
+    return {
+        "version": version,
+        "url": unique_url,
+        "source_url": TB_PATCH_NOTES_URL,
+        "summary": summary or "New Total Battle patch notes are available.",
+    }
+
+
+async def _get_text_channel(channel_id: int):
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            print(f"Could not access Discord channel {channel_id}: {e}")
+            return None
+    return channel
+
+
+async def _recent_embed_urls(channel, limit: int = 200) -> set[str]:
+    urls = set()
+    try:
+        async for message in channel.history(limit=limit):
+            if bot.user is not None and message.author.id != bot.user.id:
+                continue
+            for embed in message.embeds:
+                if embed.url:
+                    urls.add(embed.url)
+    except Exception as e:
+        print(f"Could not read recent message history in {getattr(channel, 'id', '?')}: {e}")
+        raise
+    return urls
+
+
+def _new_items_since_last_seen(items: list[dict], posted_urls: set[str], max_items: int = 5) -> list[dict]:
+    if not items:
+        return []
+
+    first_known_index = next(
+        (i for i, item in enumerate(items) if item["url"] in posted_urls),
+        None,
+    )
+
+    # Brand-new feed: establish a baseline with only the newest current item.
+    if first_known_index is None:
+        return items[:1]
+
+    # Feed lists are newest -> oldest. Anything before the newest URL we have
+    # already posted was published after our last check.
+    return [
+        item for item in items[:first_known_index]
+        if item["url"] not in posted_urls
+    ][:max_items]
+
+
+async def _post_youtube_updates(channel, entries: list[dict]) -> int:
+    posted_urls = await _recent_embed_urls(channel)
+    youtube_posts = {u for u in posted_urls if "youtube.com/watch" in u}
+    unseen = _new_items_since_last_seen(entries, youtube_posts)
+
+    count = 0
+    for entry in reversed(unseen):
+        embed = discord.Embed(
+            title=f"📺 {entry['title']}",
+            description="A new video was posted by the official Total Battle YouTube channel.",
+            url=entry["url"],
+            color=discord.Color.red(),
+        )
+        embed.set_author(name="Total Battle — Official YouTube")
+        embed.set_image(url=entry["thumbnail"])
+        embed.set_footer(text="Automatic TB News Feed")
+
+        await channel.send(embed=embed)
+        posted_urls.add(entry["url"])
+        count += 1
+
+    return count
+
+
+async def _post_help_center_news(channel, articles: list[dict]) -> int:
+    posted_urls = await _recent_embed_urls(channel)
+    previous_help_posts = {
+        u for u in posted_urls
+        if "scorewarrior.theymes.com/hc/en/total-battle/articles/" in u
+    }
+
+    news_articles = []
+    for item in articles:
+        title_lower = item["title"].strip().lower()
+        if item["url"].rstrip("/") == TB_PATCH_NOTES_URL.rstrip("/"):
+            continue
+        if title_lower == "patch notes":
+            continue
+        # Keep the channel focused on Total Battle gameplay/news rather than
+        # Triumph migration notices and legal-policy housekeeping.
+        if title_lower.startswith("[triumph]") or "terms of service" in title_lower:
+            continue
+        news_articles.append(item)
+
+    unseen = _new_items_since_last_seen(news_articles, previous_help_posts)
+
+    count = 0
+    for item in reversed(unseen):
+        embed = discord.Embed(
+            title=f"📢 {item['title']}",
+            description="A new item was posted in Total Battle's official What's New section.",
+            url=item["url"],
+            color=discord.Color.blue(),
+        )
+        embed.set_author(name="Total Battle — Official News")
+        embed.set_footer(text="Automatic TB News Feed")
+
+        await channel.send(embed=embed)
+        posted_urls.add(item["url"])
+        count += 1
+
+    return count
+
+
+async def _post_patch_update(channel, patch: dict) -> int:
+    posted_urls = await _recent_embed_urls(channel)
+    if patch["url"] in posted_urls:
+        return 0
+
+    embed = discord.Embed(
+        title=f"🛠️ Total Battle Patch Notes — {patch['version'].upper()}",
+        description=patch["summary"],
+        url=patch["url"],
+        color=discord.Color.orange(),
+    )
+    embed.set_author(name="Total Battle — Official Game Update")
+    embed.add_field(
+        name="Full Patch Notes",
+        value=f"[Read the official update]({patch['source_url']})",
+        inline=False,
+    )
+    embed.set_footer(text="Automatic TB Game Updates Feed")
+
+    # On a brand-new channel this posts the current patch once. Later checks
+    # post again only when the detected patch version changes.
+    await channel.send(embed=embed)
+    return 1
+
+
+async def run_news_feed_check() -> dict:
+    results = {"youtube": 0, "official_news": 0, "patch": 0, "errors": []}
+
+    fetch_results = await asyncio.gather(
+        asyncio.to_thread(_fetch_youtube_entries_sync),
+        asyncio.to_thread(_fetch_help_center_articles_sync),
+        asyncio.to_thread(_fetch_patch_snapshot_sync),
+        return_exceptions=True,
+    )
+
+    youtube_entries = []
+    help_articles = []
+    patch = None
+
+    if isinstance(fetch_results[0], Exception):
+        error = f"YouTube fetch: {fetch_results[0]}"
+        print(error)
+        results["errors"].append(error)
+    else:
+        youtube_entries = fetch_results[0]
+
+    if isinstance(fetch_results[1], Exception):
+        error = f"Official news fetch: {fetch_results[1]}"
+        print(error)
+        results["errors"].append(error)
+    else:
+        help_articles = fetch_results[1]
+
+    if isinstance(fetch_results[2], Exception):
+        error = f"Patch notes fetch: {fetch_results[2]}"
+        print(error)
+        results["errors"].append(error)
+    else:
+        patch = fetch_results[2]
+
+    news_channel = await _get_text_channel(TB_NEWS_CHANNEL_ID)
+    updates_channel = await _get_text_channel(TB_GAME_UPDATES_CHANNEL_ID)
+
+    if news_channel is None:
+        results["errors"].append(f"Could not access tb-news ({TB_NEWS_CHANNEL_ID})")
+    else:
+        try:
+            if youtube_entries:
+                results["youtube"] = await _post_youtube_updates(news_channel, youtube_entries)
+            if help_articles:
+                results["official_news"] = await _post_help_center_news(news_channel, help_articles)
+        except Exception as e:
+            print(f"tb-news posting error: {e}")
+            results["errors"].append(f"tb-news: {e}")
+
+    if updates_channel is None:
+        results["errors"].append(
+            f"Could not access tb-game-updates ({TB_GAME_UPDATES_CHANNEL_ID})"
+        )
+    else:
+        try:
+            if patch:
+                results["patch"] = await _post_patch_update(updates_channel, patch)
+        except Exception as e:
+            print(f"tb-game-updates posting error: {e}")
+            results["errors"].append(f"tb-game-updates: {e}")
+
+    print(
+        "News check complete: "
+        f"YouTube={results['youtube']}, "
+        f"OfficialNews={results['official_news']}, "
+        f"Patch={results['patch']}, "
+        f"Errors={len(results['errors'])}"
+    )
+    return results
+
+
+@tasks.loop(minutes=NEWS_CHECK_MINUTES)
+async def news_feed_loop():
+    await run_news_feed_check()
+
+
+@news_feed_loop.before_loop
+async def before_news_feed_loop():
+    await bot.wait_until_ready()
+
 @bot.event
 async def on_ready():
     await start_browser()
     await tree.sync()
+
+    if not news_feed_loop.is_running():
+        news_feed_loop.start()
+        print(f"Automatic Total Battle news feed started (every {NEWS_CHECK_MINUTES} minutes).")
+
     print(f"Logged in as {bot.user}")
+
+@tree.command(name="newscheck", description="Check Total Battle official news feeds now")
+async def newscheck(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        results = await run_news_feed_check()
+        posted = results["youtube"] + results["official_news"] + results["patch"]
+
+        message = (
+            f"News check finished. **{posted} new post(s)** sent.\n"
+            f"YouTube: {results['youtube']} | "
+            f"Official news: {results['official_news']} | "
+            f"Game updates: {results['patch']}"
+        )
+
+        if results["errors"]:
+            message += "\n\n⚠️ " + " | ".join(results["errors"])
+
+        await interaction.followup.send(message, ephemeral=True)
+    except Exception as e:
+        print(f"newscheck error: {e}")
+        await interaction.followup.send(
+            "The news check failed. Check Railway logs for the error.",
+            ephemeral=True,
+        )
+
 
 @tree.command(name="showtotalpoints", description="Show a player's points from TB Clan Tools")
 @app_commands.describe(user="The player name as shown in TB Clan Tools")
